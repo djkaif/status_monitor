@@ -2,28 +2,37 @@ from flask import Flask, request, jsonify
 import mysql.connector
 import os
 import time
+from dotenv import load_dotenv
 
-app = Flask(__name__)
+# ----------------- Load environment -----------------
+load_dotenv()
 
-# ===================== CONFIG =====================
-DB_HOST = os.getenv("DB_HOST")
+DB_HOST = os.getenv("DB_HOST", "us.mysql.db.bot-hosting.net")  # fallback
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 SECRET_KEY = os.getenv("CENTRAL_SECRET")
-HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", 60))  # seconds
+HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", 60))
 
-# ===================== DATABASE =====================
-db = mysql.connector.connect(
-    host=DB_HOST,
-    user=DB_USER,
-    password=DB_PASS,
-    database=DB_NAME,
-    ssl_disabled=True
-)
-cursor = db.cursor(dictionary=True)
+app = Flask(__name__)
 
-# Create tables if not exist
+# ----------------- Database connection -----------------
+try:
+    db = mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        ssl_disabled=True,  # disables SSL if server doesn't support
+        connection_timeout=10
+    )
+    cursor = db.cursor(dictionary=True)
+    print("[CENTRAL] Database connected successfully")
+except mysql.connector.Error as err:
+    print(f"[CENTRAL][ERROR] Database connection failed: {err}")
+    exit(1)
+
+# ----------------- Create tables if not exists -----------------
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS nodes (
     node_id VARCHAR(50) PRIMARY KEY,
@@ -42,8 +51,9 @@ CREATE TABLE IF NOT EXISTS status_events (
 )
 """)
 db.commit()
+print("[CENTRAL] Database initialized")
 
-# ===================== HEARTBEAT ROUTE =====================
+# ----------------- Heartbeat endpoint -----------------
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
     auth = request.headers.get("X-API-Key")
@@ -66,7 +76,7 @@ def heartbeat():
     print(f"[HEARTBEAT] {node_id} online at {timestamp}")
     return jsonify({"ok": True})
 
-# ===================== NODE STATUS CHECK =====================
+# ----------------- Node status checker -----------------
 def check_nodes():
     while True:
         current_time = int(time.time())
@@ -80,36 +90,30 @@ def check_nodes():
 
             if current_time - last_seen > HEARTBEAT_TIMEOUT:
                 if status != "offline":
-                    # Node went down
-                    cursor.execute("""
-                        UPDATE nodes SET status='offline' WHERE node_id=%s
-                    """, (node_id,))
-                    cursor.execute("""
-                        INSERT INTO status_events (node_id, old_status, new_status, timestamp)
-                        VALUES (%s, %s, %s, %s)
-                    """, (node_id, status, "offline", current_time))
+                    cursor.execute("UPDATE nodes SET status='offline' WHERE node_id=%s", (node_id,))
+                    cursor.execute(
+                        "INSERT INTO status_events (node_id, old_status, new_status, timestamp) VALUES (%s, %s, %s, %s)",
+                        (node_id, status, "offline", current_time)
+                    )
                     db.commit()
                     print(f"[ALERT] Node {node_id} is DOWN")
             else:
                 if status != "online":
-                    # Node recovered
-                    cursor.execute("""
-                        UPDATE nodes SET status='online' WHERE node_id=%s
-                    """, (node_id,))
-                    cursor.execute("""
-                        INSERT INTO status_events (node_id, old_status, new_status, timestamp)
-                        VALUES (%s, %s, %s, %s)
-                    """, (node_id, status, "online", current_time))
+                    cursor.execute("UPDATE nodes SET status='online' WHERE node_id=%s", (node_id,))
+                    cursor.execute(
+                        "INSERT INTO status_events (node_id, old_status, new_status, timestamp) VALUES (%s, %s, %s, %s)",
+                        (node_id, status, "online", current_time)
+                    )
                     db.commit()
                     print(f"[ALERT] Node {node_id} is UP")
-        time.sleep(HEARTBEAT_TIMEOUT // 2)  # check twice per timeout
+        time.sleep(max(HEARTBEAT_TIMEOUT // 2, 5))
 
-# ===================== HEALTH CHECK =====================
+# ----------------- Health check -----------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
-# ===================== RUN SERVER =====================
+# ----------------- Run server -----------------
 if __name__ == "__main__":
     import threading
     t = threading.Thread(target=check_nodes, daemon=True)
