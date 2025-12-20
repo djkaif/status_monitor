@@ -1,186 +1,165 @@
 import os
 import time
-import sqlite3
-import asyncio
+import mysql.connector
+from mysql.connector import pooling
+from flask import Flask, request, jsonify, abort
+from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+load_dotenv()
 
-# ================== CONFIG ==================
+# =======================
+# CONFIG
+# =======================
 
-CENTRAL_SECRET = os.getenv("CENTRAL_SECRET")
-OFFLINE_TIMEOUT = int(os.getenv("OFFLINE_TIMEOUT", "90"))
-DB_PATH = "data/status.db"
+API_KEY = os.getenv("CENTRAL_API_KEY")
 
-if not CENTRAL_SECRET:
-    raise RuntimeError("CENTRAL_SECRET is not set")
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT", 3306)),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+    "autocommit": True
+}
 
-# ================== APP ==================
+HEARTBEAT_TIMEOUT = 120  # seconds
 
-app = FastAPI(title="Bot Hosting Central Server")
+# =======================
+# APP INIT
+# =======================
 
-# ================== DATABASE ==================
+app = Flask(__name__)
+
+db_pool = pooling.MySQLConnectionPool(
+    pool_name="central_pool",
+    pool_size=5,
+    **DB_CONFIG
+)
+
+# =======================
+# DATABASE SETUP
+# =======================
 
 def init_db():
-    os.makedirs("data", exist_ok=True)
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute("""
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS nodes (
-            node_id TEXT PRIMARY KEY,
-            node_group TEXT,
-            status TEXT,
-            last_seen INTEGER
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            node_name VARCHAR(64) UNIQUE NOT NULL,
+            last_seen BIGINT NOT NULL,
+            status ENUM('online','offline','alert') NOT NULL
         )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            event TEXT,
-            timestamp INTEGER
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS status_events (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            node_name VARCHAR(64) NOT NULL,
+            old_status VARCHAR(16),
+            new_status VARCHAR(16),
+            timestamp BIGINT NOT NULL
         )
-        """)
-        db.commit()
+    """)
 
-init_db()
-
-# ================== MODELS ==================
-
-class Heartbeat(BaseModel):
-    node_id: str
-    group: str
-    secret: str
-    timestamp: int
-
-# ================== HELPERS ==================
-
-def get_node(node_id):
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute(
-            "SELECT status FROM nodes WHERE node_id=?",
-            (node_id,)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uptime_snapshots (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            node_name VARCHAR(64) NOT NULL,
+            is_online BOOLEAN NOT NULL,
+            timestamp BIGINT NOT NULL
         )
-        row = cur.fetchone()
-        return row[0] if row else None
+    """)
 
-def upsert_node(node_id, group, status, ts):
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute("""
-        INSERT INTO nodes (node_id, node_group, status, last_seen)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(node_id) DO UPDATE SET
-            node_group=excluded.node_group,
-            status=excluded.status,
-            last_seen=excluded.last_seen
-        """, (node_id, group, status, ts))
-        db.commit()
+    cursor.close()
+    conn.close()
+    print("[CENTRAL] Database initialized")
 
-def add_event(node_id, event, ts):
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO events (node_id, event, timestamp) VALUES (?, ?, ?)",
-            (node_id, event, ts)
-        )
-        db.commit()
+# =======================
+# AUTH
+# =======================
 
-# ================== API ==================
+def verify_key(req):
+    key = req.headers.get("X-API-Key")
+    if key != API_KEY:
+        abort(401, "Invalid API key")
 
-@app.post("/api/heartbeat")
-def heartbeat(data: Heartbeat):
-    if data.secret != CENTRAL_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
+# =======================
+# ROUTES
+# =======================
 
+@app.route("/heartbeat", methods=["POST"])
+def heartbeat():
+    verify_key(request)
+    data = request.json
+
+    node_name = data.get("node")
+    status = data.get("status", "online")
     now = int(time.time())
-    previous_status = get_node(data.node_id)
 
-    # Detect recovery
-    if previous_status == "offline":
-        add_event(data.node_id, "UP", now)
+    if not node_name:
+        return jsonify({"error": "node missing"}), 400
 
-    # First-time node
-    if previous_status is None:
-        add_event(data.node_id, "UP", now)
+    conn = db_pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
 
-    upsert_node(
-        node_id=data.node_id,
-        group=data.group,
-        status="online",
-        ts=now
+    cursor.execute(
+        "SELECT status FROM nodes WHERE node_name=%s",
+        (node_name,)
+    )
+    existing = cursor.fetchone()
+
+    if existing:
+        if existing["status"] != status:
+            cursor.execute(
+                "INSERT INTO status_events (node_name, old_status, new_status, timestamp) VALUES (%s,%s,%s,%s)",
+                (node_name, existing["status"], status, now)
+            )
+
+        cursor.execute(
+            "UPDATE nodes SET last_seen=%s, status=%s WHERE node_name=%s",
+            (now, status, node_name)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO nodes (node_name, last_seen, status) VALUES (%s,%s,%s)",
+            (node_name, now, status)
+        )
+
+    cursor.execute(
+        "INSERT INTO uptime_snapshots (node_name, is_online, timestamp) VALUES (%s,%s,%s)",
+        (node_name, status == "online", now)
     )
 
-    return {"ok": True}
+    cursor.close()
+    conn.close()
 
-@app.get("/api/nodes")
+    return jsonify({"ok": True})
+
+@app.route("/nodes", methods=["GET"])
 def list_nodes():
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute("""
-        SELECT node_id, node_group, status, last_seen
-        FROM nodes
-        ORDER BY node_group, node_id
-        """)
-        rows = cur.fetchall()
+    verify_key(request)
 
-    return {
-        "nodes": [
-            {
-                "node_id": r[0],
-                "group": r[1],
-                "status": r[2],
-                "last_seen": r[3]
-            }
-            for r in rows
-        ]
-    }
+    conn = db_pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
 
-@app.get("/api/events")
-def list_events(after_id: int = 0):
-    with sqlite3.connect(DB_PATH) as db:
-        cur = db.cursor()
-        cur.execute("""
-        SELECT id, node_id, event, timestamp
-        FROM events
-        WHERE id > ?
-        ORDER BY id ASC
-        """, (after_id,))
-        rows = cur.fetchall()
+    cursor.execute("SELECT * FROM nodes")
+    nodes = cursor.fetchall()
 
-    return {
-        "events": [
-            {
-                "id": r[0],
-                "node_id": r[1],
-                "event": r[2],
-                "timestamp": r[3]
-            }
-            for r in rows
-        ]
-    }
+    cursor.close()
+    conn.close()
 
-# ================== OFFLINE WATCHER ==================
+    return jsonify(nodes)
 
-async def offline_watcher():
-    while True:
-        now = int(time.time())
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
-        with sqlite3.connect(DB_PATH) as db:
-            cur = db.cursor()
-            cur.execute(
-                "SELECT node_id, status, last_seen FROM nodes"
-            )
-            nodes = cur.fetchall()
+# =======================
+# STARTUP
+# =======================
 
-        for node_id, status, last_seen in nodes:
-            if status == "online" and now - last_seen > OFFLINE_TIMEOUT:
-                add_event(node_id, "DOWN", now)
-                upsert_node(node_id, "unknown", "offline", last_seen)
-
-        await asyncio.sleep(10)
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(offline_watcher())
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=8000)
