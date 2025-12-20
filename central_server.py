@@ -1,134 +1,98 @@
 import os
-import time
-import threading
-from flask import Flask, request, jsonify
 import mysql.connector
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from datetime import datetime
 
-# Load environment variables from Render
+load_dotenv()
+
 DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", 3306))
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
+DB_PORT = int(os.getenv("DB_PORT", 3306))
+RESET_DB = os.getenv("RESET_DATABASE", "False").lower() == "true"
 CENTRAL_API_KEY = os.getenv("CENTRAL_API_KEY")
-OFFLINE_THRESHOLD = int(os.getenv("OFFLINE_THRESHOLD", 60))  # in seconds
-RESET_DATABASE = os.getenv("RESET_DATABASE", "False").lower() == "true"
+OFFLINE_THRESHOLD = int(os.getenv("OFFLINE_THRESHOLD", 60))
 
 app = Flask(__name__)
 
-# Connect to MySQL
-def connect_db():
-    try:
-        db = mysql.connector.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            connection_timeout=300,  # 5 min
-            ssl_disabled=True
-        )
-        print("[CENTRAL] Database connected successfully")
-        return db
-    except mysql.connector.Error as e:
-        print(f"[CENTRAL] Database connection error: {e}")
-        raise e
+# Database connection
+db = mysql.connector.connect(
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    database=DB_NAME,
+    port=DB_PORT
+)
+cursor = db.cursor(dictionary=True)
 
-db = connect_db()
-
-# Helper function to get a cursor safely
-def get_cursor():
-    try:
-        db.ping(reconnect=True)
-    except mysql.connector.Error as e:
-        print(f"[CENTRAL] MySQL ping failed, reconnecting: {e}")
-        db.reconnect()
-    return db.cursor(dictionary=True)
-
-# Reset database if requested
+# Create tables
 def init_db():
-    cursor = get_cursor()
-    if RESET_DATABASE:
+    if RESET_DB:
+        cursor.execute("DROP TABLE IF EXISTS status_history")
         cursor.execute("DROP TABLE IF EXISTS nodes")
-        print("[CENTRAL] Old database dropped")
-
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS nodes (
-            node VARCHAR(255) PRIMARY KEY,
-            node_type VARCHAR(50),
-            status VARCHAR(50),
-            last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+    CREATE TABLE IF NOT EXISTS nodes (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        node VARCHAR(255) UNIQUE NOT NULL,
+        node_type VARCHAR(50),
+        last_seen DATETIME,
+        status VARCHAR(20)
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS status_history (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        node_id INT,
+        timestamp DATETIME,
+        status VARCHAR(20),
+        FOREIGN KEY(node_id) REFERENCES nodes(id)
+    )
     """)
     db.commit()
-    cursor.close()
     print("[CENTRAL] Database initialized")
 
 init_db()
 
-# Heartbeat endpoint
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    key = request.headers.get("X-API-Key")
-    if key != CENTRAL_API_KEY:
-        return jsonify({"error": "Invalid API Key"}), 403
+    if request.headers.get("X-API-Key") != CENTRAL_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json()
+    data = request.json
     node = data.get("node")
-    node_type = data.get("node_type")
+    node_type = data.get("node_type", "Free")
     status = data.get("status", "online")
 
-    if not node or not node_type:
-        return jsonify({"error": "Missing node or node_type"}), 400
+    if not node:
+        return jsonify({"error": "Missing node name"}), 400
 
-    try:
-        cursor = get_cursor()
-        # Check if node exists
-        cursor.execute("SELECT * FROM nodes WHERE node=%s", (node,))
-        result = cursor.fetchall()
-        if result:
-            cursor.execute(
-                "UPDATE nodes SET status=%s, last_update=CURRENT_TIMESTAMP WHERE node=%s",
-                (status, node)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO nodes (node, node_type, status) VALUES (%s, %s, %s)",
-                (node, node_type, status)
-            )
+    cursor.execute("SELECT * FROM nodes WHERE node=%s", (node,))
+    node_data = cursor.fetchone()
+    now = datetime.utcnow()
+
+    if not node_data:
+        cursor.execute("INSERT INTO nodes (node, node_type, last_seen, status) VALUES (%s,%s,%s,%s)",
+                       (node, node_type, now, status))
         db.commit()
-        cursor.close()
-        return jsonify({"ok": True})
-    except mysql.connector.Error as e:
-        print(f"[CENTRAL] Database error: {e}")
-        return jsonify({"error": str(e)}), 500
+        cursor.execute("SELECT * FROM nodes WHERE node=%s", (node,))
+        node_data = cursor.fetchone()
+    else:
+        cursor.execute("UPDATE nodes SET last_seen=%s, status=%s WHERE node=%s", (now, status, node))
+        db.commit()
 
-# Optional: simple status endpoint
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+    cursor.execute("INSERT INTO status_history (node_id, timestamp, status) VALUES (%s,%s,%s)",
+                   (node_data["id"], now, status))
+    db.commit()
 
-# Background thread to check for offline nodes
-def check_nodes():
-    while True:
-        try:
-            cursor = get_cursor()
-            cursor.execute("SELECT * FROM nodes")
-            nodes = cursor.fetchall()
-            for node in nodes:
-                last_update = node["last_update"]
-                diff = (time.time() - last_update.timestamp())
-                if diff > OFFLINE_THRESHOLD:
-                    # Here you can handle alerts
-                    print(f"[ALERT] Node {node['node']} is offline")
-            cursor.close()
-            time.sleep(30)
-        except mysql.connector.Error as e:
-            print(f"[CENTRAL] Background thread DB error: {e}")
-            time.sleep(5)
+    return jsonify({"ok": True})
 
-threading.Thread(target=check_nodes, daemon=True).start()
+@app.route("/nodes/status", methods=["GET"])
+def get_status():
+    cursor.execute("SELECT * FROM nodes")
+    nodes = cursor.fetchall()
+    return jsonify(nodes)
 
 if __name__ == "__main__":
-    print("[CENTRAL] Server running...")
     app.run(host="0.0.0.0", port=8000)
