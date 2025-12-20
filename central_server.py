@@ -19,6 +19,7 @@ API_KEY = os.getenv("CENTRAL_API_KEY")
 RESET_DB = os.getenv("RESET_DATABASE", "false").lower() == "true"
 
 OFFLINE_AFTER = int(os.getenv("OFFLINE_AFTER", 60))  # seconds
+print("[DEBUG] DB_HOST =", os.getenv("DB_HOST"))
 
 # =======================
 # APP INIT
