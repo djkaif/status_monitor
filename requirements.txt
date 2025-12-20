@@ -1,4 +1,7 @@
 discord.py
 requests
+
 flask
 python-dotenv
+mysql-connector-python
+
