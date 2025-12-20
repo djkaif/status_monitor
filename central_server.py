@@ -1,163 +1,218 @@
-from flask import Flask, request, jsonify
-import mysql.connector
 import os
 import time
 import threading
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-# ----------------- Load environment -----------------
-load_dotenv()
+import mysql.connector
+from flask import Flask, request, jsonify
 
-DB_HOST = os.getenv("DB_HOST", "us.mysql.db.bot-hosting.net")
+# =======================
+# ENV CONFIG
+# =======================
+
+DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
-SECRET_KEY = os.getenv("CENTRAL_SECRET")
-HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", 60))
-RESET_DATABASE = os.getenv("RESET_DATABASE", "False").lower() in ("true", "1", "yes")
+
+API_KEY = os.getenv("CENTRAL_API_KEY")
+RESET_DB = os.getenv("RESET_DATABASE", "false").lower() == "true"
+
+OFFLINE_AFTER = int(os.getenv("OFFLINE_AFTER", 60))  # seconds
+
+# =======================
+# APP INIT
+# =======================
 
 app = Flask(__name__)
 
-# ----------------- Helper: Get DB connection -----------------
-def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASS,
-        database=DB_NAME,
-        ssl_disabled=True,
-        connection_timeout=10
+db = mysql.connector.connect(
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASS,
+    database=DB_NAME,
+    ssl_disabled=True
+)
+
+cursor = db.cursor(dictionary=True)
+
+# =======================
+# DATABASE INIT
+# =======================
+
+def init_db():
+    if RESET_DB:
+        cursor.execute("DROP TABLE IF EXISTS nodes")
+        db.commit()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS nodes (
+        node_id INT AUTO_INCREMENT PRIMARY KEY,
+        node_name VARCHAR(50) UNIQUE,
+        node_type VARCHAR(20),
+        status VARCHAR(10),
+        last_seen DATETIME,
+        offline_since DATETIME,
+        total_uptime BIGINT DEFAULT 0,
+        total_downtime BIGINT DEFAULT 0
     )
-
-# ----------------- Initialize tables -----------------
-try:
-    cnx = get_db_connection()
-    cur = cnx.cursor()
-
-    if RESET_DATABASE:
-        print("[CENTRAL] RESET_DATABASE=True -> Dropping existing tables...")
-        cur.execute("DROP TABLE IF EXISTS status_events")
-        cur.execute("DROP TABLE IF EXISTS nodes")
-        cnx.commit()
-        print("[CENTRAL] Old tables deleted")
-
-    # Create nodes table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS nodes (
-            node_id VARCHAR(50) PRIMARY KEY,
-            node_type VARCHAR(20),
-            last_seen INT,
-            status VARCHAR(20) DEFAULT 'offline'
-        )
     """)
-    # Create status_events table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS status_events (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            node_id VARCHAR(50),
-            old_status VARCHAR(20),
-            new_status VARCHAR(20),
-            timestamp INT
-        )
-    """)
-    cnx.commit()
-    cur.close()
-    cnx.close()
-    print("[CENTRAL] Database initialized successfully")
+    db.commit()
+    print("[CENTRAL] Database initialized")
 
-except mysql.connector.Error as err:
-    print(f"[CENTRAL][ERROR] Database init failed: {err}")
-    exit(1)
+init_db()
 
-# ----------------- Heartbeat endpoint -----------------
+# =======================
+# HEARTBEAT ENDPOINT
+# =======================
+
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    try:
-        auth = request.headers.get("X-API-Key")
-        if auth != SECRET_KEY:
-            return jsonify({"error": "Unauthorized"}), 401
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
 
-        data = request.json
-        node_id = data.get("node")
-        node_type = data.get("node_type", "Free")
-        timestamp = int(time.time())
+    data = request.json
+    node = data.get("node")
+    node_type = data.get("node_type", "Free")
 
-        if not node_id:
-            return jsonify({"error": "Missing node ID"}), 400
+    if not node:
+        return jsonify({"error": "node missing"}), 400
 
-        cnx = get_db_connection()
-        cur = cnx.cursor(dictionary=True)
-        cur.execute("""
-            INSERT INTO nodes (node_id, node_type, last_seen, status)
-            VALUES (%s, %s, %s, 'online')
-            ON DUPLICATE KEY UPDATE last_seen=%s, status='online'
-        """, (node_id, node_type, timestamp, timestamp))
-        cnx.commit()
-        cur.close()
-        cnx.close()
+    now = datetime.utcnow()
 
-        print(f"[HEARTBEAT] {node_id} online at {timestamp}")
-        return jsonify({"ok": True})
+    cursor.execute("SELECT * FROM nodes WHERE node_name=%s", (node,))
+    existing = cursor.fetchone()
 
-    except Exception as e:
-        print(f"[HEARTBEAT ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
+    if not existing:
+        cursor.execute("""
+            INSERT INTO nodes (node_name, node_type, status, last_seen)
+            VALUES (%s,%s,'online',%s)
+        """, (node, node_type, now))
+        db.commit()
+    else:
+        cursor.execute("""
+            UPDATE nodes SET last_seen=%s WHERE node_name=%s
+        """, (now, node))
+        db.commit()
 
-# ----------------- Node checker thread -----------------
-def check_nodes():
+    return jsonify({"ok": True})
+
+# =======================
+# NODE MONITOR THREAD
+# =======================
+
+def monitor_nodes():
     while True:
-        try:
-            cnx = get_db_connection()
-            cur = cnx.cursor(dictionary=True)
-            cur.execute("SELECT * FROM nodes")
-            nodes = cur.fetchall()
-            cur.close()
-            cnx.close()
+        time.sleep(30)
+        cursor.execute("SELECT * FROM nodes")
+        nodes = cursor.fetchall()
+        now = datetime.utcnow()
 
-            current_time = int(time.time())
-            for node in nodes:
-                node_id = node["node_id"]
-                status = node["status"]
-                last_seen = node["last_seen"]
+        for n in nodes:
+            if not n["last_seen"]:
+                continue
 
-                if current_time - last_seen > HEARTBEAT_TIMEOUT:
-                    if status != "offline":
-                        cnx = get_db_connection()
-                        cur = cnx.cursor()
-                        cur.execute("UPDATE nodes SET status='offline' WHERE node_id=%s", (node_id,))
-                        cur.execute(
-                            "INSERT INTO status_events (node_id, old_status, new_status, timestamp) VALUES (%s,%s,%s,%s)",
-                            (node_id, status, "offline", current_time)
-                        )
-                        cnx.commit()
-                        cur.close()
-                        cnx.close()
-                        print(f"[ALERT] Node {node_id} is DOWN")
-                else:
-                    if status != "online":
-                        cnx = get_db_connection()
-                        cur = cnx.cursor()
-                        cur.execute("UPDATE nodes SET status='online' WHERE node_id=%s", (node_id,))
-                        cur.execute(
-                            "INSERT INTO status_events (node_id, old_status, new_status, timestamp) VALUES (%s,%s,%s,%s)",
-                            (node_id, status, "online", current_time)
-                        )
-                        cnx.commit()
-                        cur.close()
-                        cnx.close()
-                        print(f"[ALERT] Node {node_id} is UP")
-        except Exception as e:
-            print(f"[CHECK_NODES ERROR] {e}")
+            delta = (now - n["last_seen"]).total_seconds()
 
-        time.sleep(max(HEARTBEAT_TIMEOUT // 2, 5))
+            # OFFLINE
+            if delta > OFFLINE_AFTER and n["status"] == "online":
+                cursor.execute("""
+                    UPDATE nodes
+                    SET status='offline',
+                        offline_since=%s,
+                        total_uptime=total_uptime+%s
+                    WHERE node_id=%s
+                """, (
+                    now,
+                    OFFLINE_AFTER,
+                    n["node_id"]
+                ))
+                db.commit()
 
-# ----------------- Health endpoint -----------------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+            # ONLINE AGAIN
+            elif delta <= OFFLINE_AFTER and n["status"] == "offline":
+                downtime = int((now - n["offline_since"]).total_seconds())
+                cursor.execute("""
+                    UPDATE nodes
+                    SET status='online',
+                        offline_since=NULL,
+                        total_downtime=total_downtime+%s
+                    WHERE node_id=%s
+                """, (downtime, n["node_id"]))
+                db.commit()
 
-# ----------------- Run server -----------------
+threading.Thread(target=monitor_nodes, daemon=True).start()
+
+# =======================
+# API FOR DISCORD BOT
+# =======================
+
+@app.route("/api/nodes")
+def api_nodes():
+    cursor.execute("SELECT * FROM nodes")
+    nodes = cursor.fetchall()
+
+    result = []
+    for n in nodes:
+        uptime = n["total_uptime"]
+        downtime = n["total_downtime"]
+        total = uptime + downtime
+        percent = round((uptime / total) * 100, 2) if total > 0 else 100
+
+        result.append({
+            "node_name": n["node_name"],
+            "node_type": n["node_type"],
+            "status": n["status"],
+            "last_seen": n["last_seen"],
+            "uptime_percent": percent,
+            "offline_since": n["offline_since"]
+        })
+
+    return jsonify(result)
+
+# =======================
+# WEB DASHBOARD
+# =======================
+
+@app.route("/status")
+def status():
+    cursor.execute("SELECT * FROM nodes")
+    nodes = cursor.fetchall()
+
+    html = """
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="10">
+        <style>
+            body{background:#111;color:#eee;font-family:Arial}
+            table{width:100%;border-collapse:collapse}
+            th,td{padding:10px;border-bottom:1px solid #333}
+            .online{color:#2ecc71}
+            .offline{color:#e74c3c}
+        </style>
+    </head>
+    <body>
+    <h2>Node Status</h2>
+    <table>
+    <tr><th>Node</th><th>Type</th><th>Status</th><th>Last Seen</th></tr>
+    """
+
+    for n in nodes:
+        html += f"""
+        <tr>
+            <td>{n['node_name']}</td>
+            <td>{n['node_type']}</td>
+            <td class="{n['status']}">{n['status'].upper()}</td>
+            <td>{n['last_seen']}</td>
+        </tr>
+        """
+
+    html += "</table></body></html>"
+    return html
+
+# =======================
+# START SERVER
+# =======================
+
 if __name__ == "__main__":
-    t = threading.Thread(target=check_nodes, daemon=True)
-    t.start()
     app.run(host="0.0.0.0", port=8000)
