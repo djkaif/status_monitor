@@ -56,25 +56,46 @@ print("[CENTRAL] Database initialized")
 # ----------------- Heartbeat endpoint -----------------
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    auth = request.headers.get("X-API-Key")
-    if auth != SECRET_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        auth = request.headers.get("X-API-Key")
+        if auth != SECRET_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.json
-    node_id = data.get("node")
-    node_type = data.get("node_type", "free")
-    timestamp = int(time.time())
+        data = request.json
+        node_id = data.get("node")
+        node_type = data.get("node_type", "free")  # fallback if missing
+        timestamp = int(time.time())
 
-    # Insert or update node
-    cursor.execute("""
-        INSERT INTO nodes (node_id, node_type, last_seen, status)
-        VALUES (%s, %s, %s, 'online')
-        ON DUPLICATE KEY UPDATE last_seen=%s, status='online'
-    """, (node_id, node_type, timestamp, timestamp))
-    db.commit()
+        if not node_id:
+            return jsonify({"error": "Missing node ID"}), 400
 
-    print(f"[HEARTBEAT] {node_id} online at {timestamp}")
-    return jsonify({"ok": True})
+        # Use a new DB connection for each request
+        cnx = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME,
+            ssl_disabled=True,
+            connection_timeout=10
+        )
+        cur = cnx.cursor(dictionary=True)
+
+        cur.execute("""
+            INSERT INTO nodes (node_id, node_type, last_seen, status)
+            VALUES (%s, %s, %s, 'online')
+            ON DUPLICATE KEY UPDATE last_seen=%s, status='online'
+        """, (node_id, node_type, timestamp, timestamp))
+        cnx.commit()
+        cur.close()
+        cnx.close()
+
+        print(f"[HEARTBEAT] {node_id} online at {timestamp}")
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        print(f"[HEARTBEAT ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
+        
 
 # ----------------- Node status checker -----------------
 def check_nodes():
