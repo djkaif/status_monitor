@@ -14,6 +14,7 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 SECRET_KEY = os.getenv("CENTRAL_SECRET")
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", 60))
+RESET_DATABASE = os.getenv("RESET_DATABASE", "False").lower() in ("true", "1", "yes")
 
 app = Flask(__name__)
 
@@ -32,6 +33,15 @@ def get_db_connection():
 try:
     cnx = get_db_connection()
     cur = cnx.cursor()
+
+    if RESET_DATABASE:
+        print("[CENTRAL] RESET_DATABASE=True -> Dropping existing tables...")
+        cur.execute("DROP TABLE IF EXISTS status_events")
+        cur.execute("DROP TABLE IF EXISTS nodes")
+        cnx.commit()
+        print("[CENTRAL] Old tables deleted")
+
+    # Create nodes table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS nodes (
             node_id VARCHAR(50) PRIMARY KEY,
@@ -40,6 +50,7 @@ try:
             status VARCHAR(20) DEFAULT 'offline'
         )
     """)
+    # Create status_events table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -52,7 +63,8 @@ try:
     cnx.commit()
     cur.close()
     cnx.close()
-    print("[CENTRAL] Database initialized")
+    print("[CENTRAL] Database initialized successfully")
+
 except mysql.connector.Error as err:
     print(f"[CENTRAL][ERROR] Database init failed: {err}")
     exit(1)
@@ -73,10 +85,8 @@ def heartbeat():
         if not node_id:
             return jsonify({"error": "Missing node ID"}), 400
 
-        # Use a fresh connection per request
         cnx = get_db_connection()
         cur = cnx.cursor(dictionary=True)
-
         cur.execute("""
             INSERT INTO nodes (node_id, node_type, last_seen, status)
             VALUES (%s, %s, %s, 'online')
