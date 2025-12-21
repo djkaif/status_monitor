@@ -16,7 +16,7 @@ ARCHIVE_DB = "archive.db"
 
 # Settings
 OFFLINE_THRESHOLD = int(os.getenv("OFFLINE_THRESHOLD", 90))
-BUFFER_ROTATE_SECONDS = 10 * 60  # 30 minutes
+BUFFER_ROTATE_SECONDS = 30 * 60  # 30 minutes
 ROTATE_CHECK_INTERVAL = 60       # Check rotation every 30s
 
 # ================== APP STATE ==================
